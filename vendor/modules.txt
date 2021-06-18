@@ -140,7 +140,7 @@ golang.org/x/net/idna
 # golang.org/x/oauth2 v0.0.0-20210112200429-01de73cf58bd
 golang.org/x/oauth2
 golang.org/x/oauth2/internal
-# golang.org/x/sys v0.0.0-20210330210617-4fbd30eecc44
+# golang.org/x/sys v0.0.0-20210426230700-d19ff857e887
 golang.org/x/sys/execabs
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
@@ -270,7 +270,7 @@ k8s.io/api/storage/v1beta1
 k8s.io/apiextensions-apiserver/pkg/apis/apiextensions
 k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1
 k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1
-# k8s.io/apimachinery v0.21.0
+# k8s.io/apimachinery v0.21.2
 ## explicit
 k8s.io/apimachinery/pkg/api/equality
 k8s.io/apimachinery/pkg/api/errors
