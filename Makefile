@@ -14,9 +14,9 @@
 
 GO ?= go
 
-GOLANGCI_LINT_VERSION = v1.38.0
-REPO_INFRA_VERSION = v0.1.6
-KUSTOMIZE_VERSION = 4.1.2
+GOLANGCI_LINT_VERSION = v1.41.1
+REPO_INFRA_VERSION = v0.1.8
+KUSTOMIZE_VERSION = 4.2.0
 
 CONTROLLER_GEN_CMD := $(GO) run -tags generate sigs.k8s.io/controller-tools/cmd/controller-gen
 
@@ -119,7 +119,6 @@ $(BUILD_DIR)/kustomize: $(BUILD_DIR)
 deployments: $(BUILD_DIR)/kustomize manifests generate ## Generate the deployment files with kustomize
 	$(BUILD_DIR)/kustomize build --reorder=none deploy/overlays/cluster -o deploy/operator.yaml
 	$(BUILD_DIR)/kustomize build --reorder=none deploy/overlays/namespaced -o deploy/namespace-operator.yaml
-	$(BUILD_DIR)/kustomize build --reorder=none deploy/base/webhook -o deploy/webhook.yaml
 
 .PHONY: image
 image: ## Build the container image
@@ -165,6 +164,27 @@ update-mocks: ## Update all generated mocks
 		mv tmp $$f ;\
 	done
 
+define go-build
+	$(GO) build -o $(BUILD_DIR)/$(shell basename $(1)) $(1)
+	@echo > /dev/null
+endef
+
+$(BUILD_DIR)/protoc-gen-go-grpc: $(BUILD_DIR)
+	$(call go-build,./vendor/google.golang.org/grpc/cmd/protoc-gen-go-grpc)
+
+$(BUILD_DIR)/protoc-gen-go: $(BUILD_DIR)
+	$(call go-build,./vendor/google.golang.org/protobuf/cmd/protoc-gen-go)
+
+.PHONY: update-proto
+update-proto: $(BUILD_DIR)/protoc-gen-go $(BUILD_DIR)/protoc-gen-go-grpc ## Update GRPC server protocol definitions
+	PATH=$(BUILD_DIR):$$PATH \
+		 protoc \
+			--go_out=. \
+			--go_opt=paths=source_relative \
+			--go-grpc_out=. \
+			--go-grpc_opt=paths=source_relative \
+			api/server/api.proto
+
 .PHONY: vagrant-up
 vagrant-up: ## Boot the vagrant based test VM
 	if [ ! -f image.tar ]; then \
@@ -176,14 +196,23 @@ vagrant-up: ## Boot the vagrant based test VM
 	# remote resource (like the VM image)
 	vagrant up || vagrant up || vagrant up
 
+$(BUILD_DIR)/mdtoc: $(BUILD_DIR)
+	$(call go-build,./vendor/sigs.k8s.io/mdtoc)
+
+.PHONY: update-toc
+update-toc: $(BUILD_DIR)/mdtoc ## Update the table of contents for the documentation
+	$(BUILD_DIR)/mdtoc --inplace installation-usage.md
+
 # Verification targets
 
 .PHONY: verify
-verify: verify-boilerplate verify-go-mod verify-go-lint verify-deployments ## Run all verification targets
+verify: verify-boilerplate verify-go-mod verify-go-lint verify-deployments verify-dependencies verify-toc ## Run all verification targets
 
 .PHONY: verify-boilerplate
 verify-boilerplate: $(BUILD_DIR)/verify_boilerplate.py ## Verify the boilerplate headers for all files
-	$(BUILD_DIR)/verify_boilerplate.py --boilerplate-dir hack/boilerplate
+	$(BUILD_DIR)/verify_boilerplate.py \
+		--boilerplate-dir hack/boilerplate \
+		--skip api/server/api_grpc.pb.go
 
 $(BUILD_DIR)/verify_boilerplate.py: $(BUILD_DIR)
 	curl -sfL https://raw.githubusercontent.com/kubernetes/repo-infra/$(REPO_INFRA_VERSION)/hack/verify_boilerplate.py \
@@ -212,6 +241,17 @@ $(BUILD_DIR)/golangci-lint:
 	$(BUILD_DIR)/golangci-lint linters
 
 
+.PHONY: verify-dependencies
+verify-dependencies: $(BUILD_DIR)/zeitgeist ## Verify external dependencies
+	$(BUILD_DIR)/zeitgeist validate --local-only --base-path . --config dependencies.yaml
+
+$(BUILD_DIR)/zeitgeist: $(BUILD_DIR)
+	$(call go-build,./vendor/sigs.k8s.io/zeitgeist)
+
+.PHONY: verify-toc
+verify-toc: update-toc ## Verify the table of contents for the documentation
+	hack/tree-status
+
 # Test targets
 
 .PHONY: test-unit
@@ -228,19 +268,19 @@ test-e2e: ## Run the end-to-end tests
 
 # Generate CRD manifests
 manifests:
-	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/spod/..." output:crd:stdout > deploy/base/crd.yaml
-	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/secprofnodestatus/..." output:crd:stdout >> deploy/base/crd.yaml
-	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/seccompprofile/..." output:crd:stdout >> deploy/base/crd.yaml
-	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/selinuxprofile/..." output:crd:stdout >> deploy/base/crd.yaml
-	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/profilebinding/..." output:crd:stdout > deploy/base/webhook/crd-binding.yaml
-	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/profilerecording/..." output:crd:stdout > deploy/base/webhook/crd-recording.yaml
+	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/spod/..." output:crd:stdout > deploy/base/crds/securityprofilesoperatordaemon.yaml
+	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/secprofnodestatus/..." output:crd:stdout > deploy/base/crds/securityprofilenodestatus.yaml
+	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/seccompprofile/..." output:crd:stdout > deploy/base/crds/seccompprofile.yaml
+	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/selinuxprofile/..." output:crd:stdout > deploy/base/crds/selinuxpolicy.yaml
+	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/profilebinding/..." output:crd:stdout > deploy/base/crds/profilebinding.yaml
+	$(CONTROLLER_GEN_CMD) $(CRD_OPTIONS) paths="./api/profilerecording/..." output:crd:stdout > deploy/base/crds/profilerecording.yaml
 
 # Generate deepcopy code
 generate:
 	$(CONTROLLER_GEN_CMD) object:headerFile="hack/boilerplate/boilerplate.go.txt",year=$(shell date -u "+%Y") paths="./..."
 	$(CONTROLLER_GEN_CMD) rbac:roleName=security-profiles-operator paths="./internal/pkg/manager/..." output:rbac:stdout > deploy/base/role.yaml
 	$(CONTROLLER_GEN_CMD) rbac:roleName=spod paths="./internal/pkg/daemon/..." output:rbac:stdout >> deploy/base/role.yaml
-	$(CONTROLLER_GEN_CMD) rbac:roleName=spo-webhook paths="./internal/pkg/webhooks/..." output:rbac:stdout > deploy/base/webhook/role.yaml
+	$(CONTROLLER_GEN_CMD) rbac:roleName=spo-webhook paths="./internal/pkg/webhooks/..." output:rbac:stdout >> deploy/base/role.yaml
 
 ## OpenShift-only
 ## These targets are meant to make development in OpenShift easier.

@@ -30,8 +30,8 @@ linters:
     - gofumpt
     - goheader
     - goimports
-    - golint
     - gomnd
+    - gomoddirectives
     - gomodguard
     - goprintffuncname
     - gosec
@@ -50,12 +50,13 @@ linters:
     - paralleltest
     - prealloc
     - predeclared
+    - promlinter
     - rowserrcheck
-    - scopelint
     - sqlclosecheck
     - staticcheck
     - structcheck
     - stylecheck
+    - tagliatelle
     - thelper
     - tparallel
     - typecheck
@@ -65,7 +66,6 @@ linters:
     - varcheck
     - wastedassign
     - whitespace
-    - wrapcheck
     # - cyclop
     # - exhaustivestruct
     # - forbidigo
@@ -75,8 +75,11 @@ linters:
     # - nlreturn
     # - revive
     # - testpackage
+    # - wrapcheck
     # - wsl
 linters-settings:
+  nestif:
+    min-complexity: 10
   gci:
     local-prefixes: sigs.k8s.io/security-profiles-operator
   errcheck:

@@ -18,6 +18,7 @@ package e2e_test
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,17 +31,17 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/suite"
 	"k8s.io/klog/v2/klogr"
-	"k8s.io/release/pkg/command"
-	"k8s.io/release/pkg/util"
+	"sigs.k8s.io/release-utils/command"
+	"sigs.k8s.io/release-utils/util"
 
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
 )
 
 const (
-	kindVersion      = "v0.10.0"
-	kindImage        = "kindest/node:v1.20.2"
-	kindDarwinSHA512 = "f2da2d9695ef6d26ff7183f764506223b605bc4638f04742184622ab41599988d0489a54d92ccbad90a5420e47e0868350654d3f8851e0c9afb0fe3539557e00" // nolint: lll
-	kindLinuxSHA512  = "1d2ef9f377ed513850dfd5028c80f3fefd7e3f28e3fc6050593c8a3894b74a40b9761f401ccf44d5aa199e9c753bbb9c1ffb51319f4864a1a2ba184d1574d242" // nolint: lll
+	kindVersion      = "v0.11.1"
+	kindImage        = "kindest/node:v1.21.1"
+	kindDarwinSHA512 = "602482412f3459f5c5ee1bd5e189ec776075e03114b033532c948b568bef6f32d9ea4ca73dd24e8fc6c067f33e52d5902769b91719f19d1f6a21e26717ad8871" // nolint: lll
+	kindLinuxSHA512  = "ce57a5438dcbec1269c583470695d11e5e759ad22a88a1214f0564e6513b912e3ffd380f6be61afc759a66b611bf1d966043cef16059ac096d96d81129281204" // nolint: lll
 )
 
 var (
@@ -48,8 +49,8 @@ var (
 	envSkipBuildImages              = os.Getenv("E2E_SKIP_BUILD_IMAGES")
 	envTestImage                    = os.Getenv("E2E_SPO_IMAGE")
 	envSelinuxTestsEnabled          = os.Getenv("E2E_TEST_SELINUX")
+	envLogEnricherTestsEnabled      = os.Getenv("E2E_TEST_LOG_ENRICHER")
 	envSeccompTestsEnabled          = os.Getenv("E2E_TEST_SECCOMP")
-	envProfileBindingTestsEnabled   = os.Getenv("E2E_TEST_PROFILE_BINDING")
 	envProfileRecordingTestsEnabled = os.Getenv("E2E_TEST_PROFILE_RECORDING")
 	containerRuntime                = os.Getenv("CONTAINER_RUNTIME")
 )
@@ -67,8 +68,8 @@ type e2e struct {
 	selinuxdImage        string
 	pullPolicy           string
 	selinuxEnabled       bool
+	logEnricherEnabled   bool
 	testSeccomp          bool
-	testProfileBinding   bool
 	testProfileRecording bool
 	logger               logr.Logger
 	execNode             func(node string, args ...string) string
@@ -103,18 +104,19 @@ func TestSuite(t *testing.T) {
 	if err != nil {
 		selinuxEnabled = false
 	}
+	logEnricherEnabled, err := strconv.ParseBool(envLogEnricherTestsEnabled)
+	if err != nil {
+		logEnricherEnabled = false
+	}
 	testSeccomp, err := strconv.ParseBool(envSeccompTestsEnabled)
 	if err != nil {
 		testSeccomp = true
-	}
-	testProfileBinding, err := strconv.ParseBool(envProfileBindingTestsEnabled)
-	if err != nil {
-		testProfileBinding = true
 	}
 	testProfileRecording, err := strconv.ParseBool(envProfileRecordingTestsEnabled)
 	if err != nil {
 		testProfileRecording = false
 	}
+
 	selinuxdImage := "quay.io/jaosorior/selinuxd"
 	switch {
 	case clusterType == "" || strings.EqualFold(clusterType, clusterTypeKind):
@@ -127,8 +129,8 @@ func TestSuite(t *testing.T) {
 				pullPolicy:           "Never",
 				testImage:            testImage,
 				selinuxEnabled:       selinuxEnabled,
+				logEnricherEnabled:   logEnricherEnabled,
 				testSeccomp:          testSeccomp,
-				testProfileBinding:   testProfileBinding,
 				testProfileRecording: testProfileRecording,
 				selinuxdImage:        selinuxdImage,
 			},
@@ -151,8 +153,8 @@ func TestSuite(t *testing.T) {
 				pullPolicy:           "Always",
 				testImage:            testImage,
 				selinuxEnabled:       selinuxEnabled,
+				logEnricherEnabled:   logEnricherEnabled,
 				testSeccomp:          testSeccomp,
-				testProfileBinding:   testProfileBinding,
 				testProfileRecording: testProfileRecording,
 				selinuxdImage:        selinuxdImage,
 			},
@@ -170,8 +172,8 @@ func TestSuite(t *testing.T) {
 				pullPolicy:           "Never",
 				testImage:            testImage,
 				selinuxEnabled:       selinuxEnabled,
+				logEnricherEnabled:   logEnricherEnabled,
 				testSeccomp:          testSeccomp,
-				testProfileBinding:   testProfileBinding,
 				testProfileRecording: testProfileRecording,
 				selinuxdImage:        selinuxdImage,
 			},
@@ -230,7 +232,7 @@ func (e *kinde2e) SetupTest() {
 
 	// Wait for the nodes to  be ready
 	e.logf("Waiting for cluster to be ready")
-	e.kubectl("wait", "--for", "condition=ready", "nodes", "--all", "--timeout=120s")
+	e.waitFor("condition=ready", "nodes", "--all")
 
 	// Build and load the test image
 	e.logf("Building operator container image")
@@ -429,6 +431,53 @@ func (e *e2e) kubectlOperatorNS(args ...string) string {
 	)
 }
 
+func (e *e2e) kubectlRun(args ...string) string {
+	return e.kubectl(
+		append([]string{
+			"run",
+			"--timeout=5m",
+			"--pod-running-timeout=5m",
+			"--rm",
+			"-i",
+			"--restart=Never",
+			"--image=registry.fedoraproject.org/fedora-minimal:latest",
+		}, args...)...,
+	)
+}
+
+func (e *e2e) kubectlRunOperatorNS(args ...string) string {
+	return e.kubectlRun(
+		append([]string{"-n", config.OperatorName}, args...)...,
+	)
+}
+
+const (
+	curlBaseCMD = "curl -ksfL --retry 5 --retry-delay 3 --show-error "
+	curlCMD     = curlBaseCMD + "-H \"Authorization: Bearer `cat /var/run/secrets/kubernetes.io/serviceaccount/token`\" "
+	metricsURL  = "https://metrics.security-profiles-operator.svc.cluster.local/"
+	curlSpodCMD = curlCMD + metricsURL + "metrics-spod"
+	curlCtrlCMD = curlCMD + metricsURL + "metrics"
+)
+
+func (e *e2e) getSpodMetrics() string {
+	rand.Seed(time.Now().UnixNano())
+	letters := []rune("abcdefghijklmnopqrstuvwxyz")
+	b := make([]rune, 10)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))] // nolint: gosec
+	}
+	// Sometimes the metrics command does not output anything in CI. We fix
+	// that by retrying the metrics retrieval several times.
+	for i := 0; i < 5; i++ {
+		output := e.kubectlRunOperatorNS("pod-"+string(b), "--", "bash", "-c", curlSpodCMD)
+		if len(strings.Split(output, "\n")) > 1 {
+			return output
+		}
+	}
+	e.Fail("unable to retrieve SPOD metrics")
+	return ""
+}
+
 func (e *e2e) waitFor(args ...string) {
 	e.kubectl(
 		append([]string{"wait", "--timeout", defaultWaitTimeout, "--for"}, args...)...,
@@ -445,7 +494,7 @@ func (e *e2e) logf(format string, a ...interface{}) {
 	e.logger.Info(fmt.Sprintf(format, a...))
 }
 
-func (e *e2e) selinuxtOnlyTestCase() {
+func (e *e2e) selinuxOnlyTestCase() {
 	if !e.selinuxEnabled {
 		e.T().Skip("Skipping SELinux-related test")
 	}
@@ -466,15 +515,27 @@ func (e *e2e) enableSelinuxInSpod() {
 	}
 }
 
+func (e *e2e) logEnricherOnlyTestCase() {
+	if !e.logEnricherEnabled {
+		e.T().Skip("Skipping log-enricher related test")
+	}
+
+	e.enableLogEnricherInSpod()
+}
+
+func (e *e2e) enableLogEnricherInSpod() {
+	e.logf("Enable log-enricher in SPOD")
+	e.kubectlOperatorNS("patch", "spod", "spod", "-p", `{"spec":{"enableLogEnricher": true}}`, "--type=merge")
+
+	time.Sleep(defaultWaitTime)
+	e.waitInOperatorNSFor("condition=ready", "spod", "spod")
+
+	e.kubectlOperatorNS("rollout", "status", "ds", "spod", "--timeout", defaultLogEnricherOpTimeout)
+}
+
 func (e *e2e) seccompOnlyTestCase() {
 	if !e.testSeccomp {
 		e.T().Skip("Skipping Seccomp-related test")
-	}
-}
-
-func (e *e2e) profileBindingTestCase() {
-	if !e.testProfileBinding {
-		e.T().Skip("Skipping Profile-Binding-related test")
 	}
 }
 

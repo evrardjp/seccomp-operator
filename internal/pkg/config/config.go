@@ -21,7 +21,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"k8s.io/release/pkg/util"
+	"sigs.k8s.io/release-utils/env"
 )
 
 const (
@@ -57,10 +57,28 @@ const (
 	// the operator to work on only a single Kubernetes namespace.
 	RestrictNamespaceEnvKey = "RESTRICT_TO_NAMESPACE"
 
-	// SeccompProfileRecordAnnotationKey is the annotation on a Pod that
+	// SeccompProfileRecordHookAnnotationKey is the annotation on a Pod that
 	// triggers the oci-seccomp-bpf-hook to trace the syscalls of a Pod and
 	// created a seccomp profile.
-	SeccompProfileRecordAnnotationKey = "io.containers.trace-syscall"
+	SeccompProfileRecordHookAnnotationKey = "io.containers.trace-syscall/"
+
+	// SeccompProfileRecordLogsAnnotationKey is the annotation on a Pod that
+	// triggers the internal log enricher to trace the syscalls of a Pod and
+	// created a seccomp profile.
+	SeccompProfileRecordLogsAnnotationKey = "io.containers.trace-logs/"
+
+	// HealthProbePort is the port where the liveness probe will be served.
+	HealthProbePort = 8085
+
+	// AuditLogPath is the path to the auditd log file.
+	AuditLogPath = "/var/log/audit/audit.log"
+
+	// SyslogLogPath is the path to the syslog log file.
+	SyslogLogPath = "/var/log/syslog"
+
+	// LogEnricherProfile is the seccomp profile name for tracing syscalls from
+	// the log enricher.
+	LogEnricherProfile = "log-enricher-trace"
 )
 
 // ProfileRecordingOutputPath is the path where the recorded profiles will be
@@ -83,7 +101,7 @@ func GetOperatorNamespace() string {
 func TryToGetOperatorNamespace() (string, error) {
 	// This is OPERATOR_NAMESPACE should have been set by the downward API to identify
 	// the namespace which this controller is running from
-	operatorNS := util.EnvDefault(OperatorNamespaceEnvKey, "")
+	operatorNS := env.Default(OperatorNamespaceEnvKey, "")
 	if operatorNS == "" {
 		return "", ErrPodNamespaceEnvNotFound
 	}

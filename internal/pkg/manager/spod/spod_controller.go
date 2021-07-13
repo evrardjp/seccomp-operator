@@ -19,6 +19,7 @@ package spod
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/go-logr/logr"
@@ -27,15 +28,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
 	sccmpv1alpha1 "sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1alpha1"
 	spodv1alpha1 "sigs.k8s.io/security-profiles-operator/api/spod/v1alpha1"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/controller"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/manager/spod/bindata"
 )
 
@@ -43,6 +47,11 @@ const (
 	reasonCannotCreateSPOD event.Reason = "CannotCreateSPOD"
 	reasonCannotUpdateSPOD event.Reason = "CannotUpdateSPOD"
 )
+
+// NewController returns a new empty controller instance.
+func NewController() controller.Controller {
+	return &ReconcileSPOd{}
+}
 
 // blank assignment to verify that ReconcileSPOd implements `reconcile.Reconciler`.
 var _ reconcile.Reconciler = &ReconcileSPOd{}
@@ -57,6 +66,21 @@ type ReconcileSPOd struct {
 	record         event.Recorder
 	log            logr.Logger
 	watchNamespace string
+}
+
+// Name returns the name of the controller.
+func (r *ReconcileSPOd) Name() string {
+	return "spod-config"
+}
+
+// SchemeBuilder returns the API scheme of the controller.
+func (r *ReconcileSPOd) SchemeBuilder() *scheme.Builder {
+	return spodv1alpha1.SchemeBuilder
+}
+
+// Healthz is the liveness probe endpoint of the controller.
+func (r *ReconcileSPOd) Healthz(*http.Request) error {
+	return nil
 }
 
 // Security Profiles Operator RBAC permissions to manage its own configuration
@@ -77,6 +101,9 @@ type ReconcileSPOd struct {
 //
 // Needed for default profiles:
 // +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,resources=seccompprofiles,verbs=get;list;watch;create;update;patch
+//
+// Needed for the ServiceMonitor
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch
 //
 // OpenShift (This is ignored in other distros):
 // +kubebuilder:rbac:groups=security.openshift.io,namespace="security-profiles-operator",resources=securitycontextconstraints,verbs=use
@@ -252,6 +279,20 @@ func (r *ReconcileSPOd) handleCreate(
 		}
 	}
 
+	r.log.Info("Deploying operator service monitor")
+	if err := r.client.Create(
+		ctx, bindata.ServiceMonitor(),
+	); err != nil {
+		// nolint: gocritic
+		if runtime.IsNotRegisteredError(err) || meta.IsNoMatchError(err) {
+			r.log.Info("Service monitor resource does not seem to exist, ignoring")
+		} else if kerrors.IsAlreadyExists(err) {
+			r.log.Info("Service monitor already exist, skipping")
+		} else {
+			return errors.Wrap(err, "creating service monitor")
+		}
+	}
+
 	return nil
 }
 
@@ -281,7 +322,9 @@ func (r *ReconcileSPOd) handleUpdate(
 		foundProfile := &sccmpv1alpha1.SeccompProfile{}
 		var err error
 		if err = r.client.Get(ctx, pKey, foundProfile); err == nil {
-			if updateErr := r.client.Update(ctx, profile); updateErr != nil {
+			updatedProfile := foundProfile.DeepCopy()
+			updatedProfile.Spec = *profile.Spec.DeepCopy()
+			if updateErr := r.client.Update(ctx, updatedProfile); updateErr != nil {
 				return errors.Wrapf(
 					updateErr, "updating operator default profile %s", profile.Name,
 				)
@@ -305,6 +348,20 @@ func (r *ReconcileSPOd) handleUpdate(
 		return errors.Wrapf(
 			err, "getting operator default profile %s", profile.Name,
 		)
+	}
+
+	r.log.Info("Updating operator service monitor")
+	if err := r.client.Patch(
+		ctx, bindata.ServiceMonitor(), client.Merge,
+	); err != nil {
+		// nolint: gocritic
+		if runtime.IsNotRegisteredError(err) || meta.IsNoMatchError(err) {
+			r.log.Info("Service monitor resource does not seem to exist, ignoring")
+		} else if kerrors.IsAlreadyExists(err) {
+			r.log.Info("Service monitor already exist, skipping")
+		} else {
+			return errors.Wrap(err, "updating service monitor")
+		}
 	}
 
 	return nil
@@ -348,15 +405,21 @@ func (r *ReconcileSPOd) getConfiguredSPOd(
 
 	// Log enricher parameters
 	if cfg.Spec.EnableLogEnricher {
+		r.baseSPOd.Spec.Template.Spec.Containers[2].Image = image
 		templateSpec.Containers = append(
 			templateSpec.Containers,
 			r.baseSPOd.Spec.Template.Spec.Containers[2])
-		templateSpec.Containers[2].Image = image
 
 		// HostPID is only required for the log-enricher
 		// and is used to access cgroup files to map Process IDs to Pod IDs
 		templateSpec.HostPID = true
 	}
+
+	// Metrics parameters
+	templateSpec.Containers = append(
+		templateSpec.Containers,
+		r.baseSPOd.Spec.Template.Spec.Containers[3],
+	)
 
 	// Set image pull policy
 	for i := range templateSpec.InitContainers {
@@ -364,6 +427,10 @@ func (r *ReconcileSPOd) getConfiguredSPOd(
 	}
 
 	for i := range templateSpec.Containers {
+		// The metrics image should be pulled always as IfNotPresent
+		if templateSpec.Containers[i].Image == bindata.MetricsImage {
+			continue
+		}
 		templateSpec.Containers[i].ImagePullPolicy = pullPolicy
 	}
 

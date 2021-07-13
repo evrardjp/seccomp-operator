@@ -23,33 +23,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/urfave/cli/v2"
-	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2/klogr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
 	profilebindingv1alpha1 "sigs.k8s.io/security-profiles-operator/api/profilebinding/v1alpha1"
 	profilerecording1alpha1 "sigs.k8s.io/security-profiles-operator/api/profilerecording/v1alpha1"
 	seccompprofilev1alpha1 "sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1alpha1"
 	secprofnodestatusv1alpha1 "sigs.k8s.io/security-profiles-operator/api/secprofnodestatus/v1alpha1"
 	selinuxprofilev1alpha1 "sigs.k8s.io/security-profiles-operator/api/selinuxprofile/v1alpha1"
-	spodv1alpha1 "sigs.k8s.io/security-profiles-operator/api/spod/v1alpha1"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/controller"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/enricher"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/metrics"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/profilerecorder"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/seccompprofile"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/selinuxprofile"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/server"
 	nodestatus "sigs.k8s.io/security-profiles-operator/internal/pkg/manager/nodestatus"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/manager/spod"
-	wa "sigs.k8s.io/security-profiles-operator/internal/pkg/manager/workloadannotator"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/manager/workloadannotator"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/nonrootenabler"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/version"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/webhooks/binding"
@@ -59,7 +56,6 @@ import (
 const (
 	jsonFlag           string = "json"
 	selinuxFlag        string = "with-selinux"
-	selinuxdImageKey   string = "RELATED_IMAGE_SELINUXD"
 	defaultWebhookPort int    = 9443
 )
 
@@ -137,11 +133,9 @@ func main() {
 			},
 		},
 		&cli.Command{
-			Name:  "non-root-enabler",
-			Usage: "run the non root enabler",
-			Action: func(*cli.Context) error {
-				return nonrootenabler.New().Run()
-			},
+			Name:   "non-root-enabler",
+			Usage:  "run the non root enabler",
+			Action: runNonRootEnabler,
 		},
 		&cli.Command{
 			Name:    "log-enricher",
@@ -186,11 +180,6 @@ func runManager(ctx *cli.Context) error {
 		LeaderElectionID: "security-profiles-operator-lock",
 	}
 
-	dt, err := getTunables()
-	if err != nil {
-		return err
-	}
-
 	setControllerOptionsForNamespaces(&ctrlOpts)
 
 	mgr, err := ctrl.NewManager(cfg, ctrlOpts)
@@ -198,9 +187,6 @@ func runManager(ctx *cli.Context) error {
 		return errors.Wrap(err, "create cluster manager")
 	}
 
-	if err := spodv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
-		return errors.Wrap(err, "add SPOD API to scheme")
-	}
 	if err := profilebindingv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
 		return errors.Wrap(err, "add profilebinding API to scheme")
 	}
@@ -210,26 +196,16 @@ func runManager(ctx *cli.Context) error {
 	if err := selinuxprofilev1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
 		return errors.Wrap(err, "add selinuxprofile API to scheme")
 	}
-
-	// This API provides status which is used by both seccomp and selinux
-	if err := secprofnodestatusv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
-		return errors.Wrap(err, "add per-node Status API to scheme")
+	if err := monitoringv1.AddToScheme(mgr.GetScheme()); err != nil {
+		return errors.Wrap(err, "add ServiceMonitor API to scheme")
 	}
 
-	if err := createConfigIfNotExist(ctx.Context, mgr.GetClient()); err != nil {
-		return errors.Wrap(err, "ensure SPOD config")
-	}
-
-	if err := spod.Setup(ctx.Context, mgr, &dt, ctrl.Log.WithName("spod-config")); err != nil {
-		return errors.Wrap(err, "setup profile controller")
-	}
-
-	if err := nodestatus.Setup(ctx.Context, mgr, ctrl.Log.WithName("nodestatus")); err != nil {
-		return errors.Wrap(err, "setup node status controller")
-	}
-
-	if err := wa.Setup(ctx.Context, mgr, ctrl.Log.WithName("workload-annotator")); err != nil {
-		return errors.Wrap(err, "setup workload annotator controller")
+	if err := setupEnabledControllers(ctx.Context, []controller.Controller{
+		nodestatus.NewController(),
+		spod.NewController(),
+		workloadannotator.NewController(),
+	}, mgr, nil); err != nil {
+		return errors.Wrap(err, "enable controllers")
 	}
 
 	setupLog.Info("starting manager")
@@ -238,41 +214,6 @@ func runManager(ctx *cli.Context) error {
 	}
 
 	setupLog.Info("ending manager")
-	return nil
-}
-
-func createConfigIfNotExist(ctx context.Context, c client.Client) error {
-	obj := &spodv1alpha1.SecurityProfilesOperatorDaemon{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "spod",
-			Namespace: config.GetOperatorNamespace(),
-			Labels:    map[string]string{"app": config.OperatorName},
-		},
-		Spec: spodv1alpha1.SPODSpec{
-			EnableSelinux:     false,
-			EnableLogEnricher: false,
-			Tolerations: []corev1.Toleration{
-				{
-					Key:      "node-role.kubernetes.io/master",
-					Operator: corev1.TolerationOpExists,
-					Effect:   corev1.TaintEffectNoSchedule,
-				},
-				{
-					Key:      "node-role.kubernetes.io/control-plane",
-					Operator: corev1.TolerationOpExists,
-					Effect:   corev1.TaintEffectNoSchedule,
-				},
-				{
-					Key:      "node.kubernetes.io/not-ready",
-					Operator: corev1.TolerationOpExists,
-					Effect:   corev1.TaintEffectNoExecute,
-				},
-			},
-		},
-	}
-	if err := c.Create(ctx, obj); !k8serrors.IsAlreadyExists(err) {
-		return errors.Wrap(err, "create SecurityProfilesOperatorDaemon object")
-	}
 	return nil
 }
 
@@ -304,53 +245,17 @@ func setControllerOptionsForNamespaces(opts *ctrl.Options) {
 	}
 }
 
-func getTunables() (dt spod.DaemonTunables, err error) {
-	dt.WatchNamespace = os.Getenv(config.RestrictNamespaceEnvKey)
-
-	selinuxdImage := os.Getenv(selinuxdImageKey)
-	if selinuxdImage == "" {
-		return dt, errors.New("invalid selinuxd image")
+func getEnabledControllers(ctx *cli.Context) []controller.Controller {
+	controllers := []controller.Controller{
+		seccompprofile.NewController(),
+		profilerecorder.NewController(),
 	}
-	dt.SelinuxdImage = selinuxdImage
-
-	return dt, nil
-}
-
-// TODO(jhrozek): the type seems out of place here, maybe we should move it to a file under internal/pkg/controllers
-// that would just define the type and nothing else.
-type daemonSetupFunc func(ctx context.Context, mgr ctrl.Manager, l logr.Logger) error
-
-type controllerSettings struct {
-	name          string
-	setupFn       daemonSetupFunc
-	schemaBuilder *scheme.Builder
-}
-
-func getEnabledControllers(ctx *cli.Context) []*controllerSettings {
-	enabledSettings := make([]*controllerSettings, 0, 2)
-
-	enabledSettings = append(enabledSettings,
-		&controllerSettings{
-			name:          "seccomp-spod",
-			setupFn:       seccompprofile.Setup,
-			schemaBuilder: seccompprofilev1alpha1.SchemeBuilder,
-		},
-		&controllerSettings{
-			name:          "recorder-spod",
-			setupFn:       profilerecorder.Setup,
-			schemaBuilder: profilerecording1alpha1.SchemeBuilder,
-		},
-	)
 
 	if ctx.Bool(selinuxFlag) {
-		enabledSettings = append(enabledSettings, &controllerSettings{
-			name:          "selinux-spod",
-			setupFn:       selinuxprofile.Setup,
-			schemaBuilder: selinuxprofilev1alpha1.SchemeBuilder,
-		})
+		controllers = append(controllers, selinuxprofile.NewController())
 	}
 
-	return enabledSettings
+	return controllers
 }
 
 func runDaemon(ctx *cli.Context) error {
@@ -370,7 +275,8 @@ func runDaemon(ctx *cli.Context) error {
 	sigHandler := ctrl.SetupSignalHandler()
 
 	ctrlOpts := ctrl.Options{
-		SyncPeriod: &sync,
+		SyncPeriod:             &sync,
+		HealthProbeBindAddress: fmt.Sprintf(":%d", config.HealthProbePort),
 	}
 
 	setControllerOptionsForNamespaces(&ctrlOpts)
@@ -380,13 +286,27 @@ func runDaemon(ctx *cli.Context) error {
 		return errors.Wrap(err, "create manager")
 	}
 
+	// Setup metrics
+	met := metrics.New()
+	if err := met.Register(); err != nil {
+		return errors.Wrap(err, "register metrics")
+	}
+
+	if err := mgr.AddMetricsExtraHandler(metrics.HandlerPath, met.Handler()); err != nil {
+		return errors.Wrap(err, "add metrics extra handler")
+	}
+
+	// Setup the GRPC server
+	if err := server.New(ctrl.Log.WithName("server"), met).Start(); err != nil {
+		return errors.Wrap(err, "start GRPC server")
+	}
+
 	// This API provides status which is used by both seccomp and selinux
 	if err := secprofnodestatusv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
 		return errors.Wrap(err, "add per-node Status API to scheme")
 	}
 
-	err = setupEnabledControllers(ctx.Context, enabledControllers, mgr)
-	if err != nil {
+	if err := setupEnabledControllers(ctx.Context, enabledControllers, mgr, met); err != nil {
 		return errors.Wrap(err, "enable controllers")
 	}
 
@@ -400,9 +320,15 @@ func runDaemon(ctx *cli.Context) error {
 }
 
 func runLogEnricher(ctx *cli.Context) error {
-	printInfo("log-enricher")
-	enricher.Run(ctrl.Log.WithName("log-enricher"))
-	return nil
+	const component = "log-enricher"
+	printInfo(component)
+	return enricher.New(ctrl.Log.WithName(component)).Run()
+}
+
+func runNonRootEnabler(ctx *cli.Context) error {
+	const component = "non-root-enabler"
+	printInfo(component)
+	return nonrootenabler.New().Run(ctrl.Log.WithName(component))
 }
 
 func runWebhook(ctx *cli.Context) error {
@@ -448,14 +374,27 @@ func runWebhook(ctx *cli.Context) error {
 	return nil
 }
 
-func setupEnabledControllers(ctx context.Context, enabledControllers []*controllerSettings, mgr ctrl.Manager) error {
+func setupEnabledControllers(
+	ctx context.Context,
+	enabledControllers []controller.Controller,
+	mgr ctrl.Manager,
+	met *metrics.Metrics,
+) error {
 	for _, enableCtrl := range enabledControllers {
-		if err := enableCtrl.schemaBuilder.AddToScheme(mgr.GetScheme()); err != nil {
-			return errors.Wrap(err, "add core operator APIs to scheme")
+		if enableCtrl.SchemeBuilder() != nil {
+			if err := enableCtrl.SchemeBuilder().AddToScheme(mgr.GetScheme()); err != nil {
+				return errors.Wrap(err, "add core operator APIs to scheme")
+			}
 		}
 
-		if err := enableCtrl.setupFn(ctx, mgr, ctrl.Log.WithName(enableCtrl.name)); err != nil {
-			return errors.Wrapf(err, "setup %s controller", enableCtrl.name)
+		if err := enableCtrl.Setup(ctx, mgr, met); err != nil {
+			return errors.Wrapf(err, "setup %s controller", enableCtrl.Name())
+		}
+
+		if met != nil {
+			if err := mgr.AddHealthzCheck(enableCtrl.Name(), enableCtrl.Healthz); err != nil {
+				return errors.Wrap(err, "add readiness check to controller")
+			}
 		}
 	}
 

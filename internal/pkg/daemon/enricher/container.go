@@ -18,22 +18,16 @@ package enricher
 
 import (
 	"bufio"
-	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
+	"strconv"
 
+	"github.com/ReneKroon/ttlcache/v2"
 	"github.com/pkg/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-)
 
-const (
-	crioCgroupRegex = `\/.+-([a-f0-9]+)`
-	crioPrefix      = "cri-o://"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/util"
 )
 
 // NOTE(jaosorior): Should this actually be namespace-scoped?
@@ -41,58 +35,112 @@ const (
 // Cluster scoped
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;
 
-func getNodeContainers(nodeName string) (map[string]containerInfo, error) {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("get in-cluster config: %w", err)
+func (e *Enricher) getContainerInfo(
+	nodeName, containerID string,
+) (*containerInfo, error) {
+	// Check the cache first
+	if info, err := e.infoCache.Get(
+		containerID,
+	); !errors.Is(err, ttlcache.ErrNotFound) {
+		return info.(*containerInfo), nil
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	clusterConfig, err := e.impl.InClusterConfig()
 	if err != nil {
-		return nil, fmt.Errorf("load in-cluster config: %w", err)
+		return nil, errors.Wrap(err, "get in-cluster config")
 	}
 
-	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + nodeName,
-	})
+	clientset, err := e.impl.NewForConfig(clusterConfig)
 	if err != nil {
-		return nil, fmt.Errorf("list node %s's pods: %w", nodeName, err)
+		return nil, errors.Wrap(err, "load in-cluster config")
 	}
 
-	containers := make(map[string]containerInfo)
-	for p := range pods.Items {
-		for c := range pods.Items[p].Status.ContainerStatuses {
-			containerID, err := containerIDRaw(pods.Items[p].Status.ContainerStatuses[c].ContainerID)
+	errContainerIDEmpty := errors.New("container ID is empty")
+	if err := util.Retry(
+		func() (retryErr error) {
+			pods, err := e.impl.ListPods(clientset, nodeName)
 			if err != nil {
-				return nil, fmt.Errorf("container id: %w", err)
+				return errors.Wrapf(err, "list node %s's pods", nodeName)
 			}
 
-			containers[containerID] = containerInfo{
-				PodName:       pods.Items[p].Name,
-				ContainerName: pods.Items[p].Status.ContainerStatuses[c].Name,
-				Namespace:     pods.Items[p].Namespace,
-				ContainerID:   containerID,
+			for p := range pods.Items {
+				pod := &pods.Items[p]
+
+				for c := range pod.Status.ContainerStatuses {
+					containerStatus := pod.Status.ContainerStatuses[c]
+					containerID := containerStatus.ContainerID
+					containerName := containerStatus.Name
+
+					if containerID == "" {
+						e.logger.Info(
+							"container ID is still empty, retrying",
+							"podName", pod.Name,
+							"containerName", containerName,
+						)
+						return errContainerIDEmpty
+					}
+
+					rawContainerID := regexID.FindString(containerID)
+					if rawContainerID == "" {
+						e.logger.Error(
+							err, "unable to get container ID",
+							"podName", pod.Name,
+							"containerName", containerName,
+						)
+						continue
+					}
+
+					recordProfile := pod.Annotations[config.SeccompProfileRecordLogsAnnotationKey+containerName]
+					info := &containerInfo{
+						podName:       pod.Name,
+						containerName: containerStatus.Name,
+						namespace:     pod.Namespace,
+						containerID:   rawContainerID,
+						recordProfile: recordProfile,
+					}
+
+					// Update the cache
+					if err := e.infoCache.Set(rawContainerID, info); err != nil {
+						return errors.Wrap(err, "update cache")
+					}
+				}
 			}
-		}
+			return nil
+		},
+		func(inErr error) bool {
+			return errors.Is(inErr, errContainerIDEmpty)
+		},
+	); err != nil {
+		return nil, errors.Wrap(err, "get container info for pods")
 	}
-	return containers, nil
+
+	if info, err := e.infoCache.Get(
+		containerID,
+	); !errors.Is(err, ttlcache.ErrNotFound) {
+		return info.(*containerInfo), nil
+	}
+
+	return nil, errors.New("no container info for container ID")
 }
 
-func containerIDRaw(containerID string) (string, error) {
-	if strings.Contains(containerID, crioPrefix) {
-		return strings.TrimPrefix(containerID, crioPrefix), nil
+// We assume that a container ID has a length of 64.
+var regexID = regexp.MustCompile(`[0-9a-f]{64}`)
+
+func (e *Enricher) getContainerID(processID int) (string, error) {
+	// Check the cache first
+	if id, err := e.containerIDCache.Get(
+		strconv.Itoa(processID),
+	); !errors.Is(err, ttlcache.ErrNotFound) {
+		return id.(string), nil
 	}
 
-	return "", errors.Wrap(errUnsupportedContainerRuntime, containerID)
-}
+	cgroupPath := fmt.Sprintf("/proc/%d/cgroup", processID)
 
-func getContainerID(processID int) string {
-	cgroupFile := fmt.Sprintf("/proc/%d/cgroup", processID)
-	file, err := os.Open(filepath.Clean(cgroupFile))
+	file, err := e.impl.Open(filepath.Clean(cgroupPath))
 	if err != nil {
-		logger.Error(nil, "could not open cgroup", "process-id", processID)
-		return ""
+		return "", errors.Wrap(err, "could not open cgroup path")
 	}
+
 	defer func() {
 		cerr := file.Close()
 		if err == nil {
@@ -101,22 +149,18 @@ func getContainerID(processID int) string {
 	}()
 
 	scanner := bufio.NewScanner(file)
-	scanner.Split(bufio.ScanLines)
 	for scanner.Scan() {
-		if containerID := extractID(scanner.Text()); containerID != "" {
-			return containerID
+		if containerID := regexID.FindString(scanner.Text()); containerID != "" {
+			// Update the cache
+			if err := e.containerIDCache.Set(
+				strconv.Itoa(processID), containerID,
+			); err != nil {
+				return "", errors.Wrap(err, "update cache")
+			}
+
+			return containerID, nil
 		}
 	}
 
-	return ""
-}
-
-func extractID(cgroup string) string {
-	containerIDRegex := regexp.MustCompile(crioCgroupRegex)
-	capture := containerIDRegex.FindStringSubmatch(cgroup)
-	if len(capture) > 1 {
-		return capture[1]
-	}
-
-	return ""
+	return "", errors.New("unable to find container ID from cgroup path")
 }

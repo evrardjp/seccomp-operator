@@ -19,7 +19,7 @@ ENVFILE=$(dirname "${BASH_SOURCE[0]}")/env.sh
 . "$ENVFILE"
 
 K8SPATH="$GOPATH/src/k8s.io"
-VERSION=v1.20.2
+VERSION=v1.21.0
 
 download-kubernetes() {
     export KUBERNETES_RELEASE=$VERSION
@@ -36,7 +36,7 @@ download-kubernetes() {
 local-up() {
     export PATH="$GOPATH/src/k8s.io/kubernetes/third_party/etcd:$PATH"
     export CONTAINER_RUNTIME=remote
-    export CGROUP_DRIVER=cgroupfs
+    export CGROUP_DRIVER=systemd
     export CONTAINER_RUNTIME_ENDPOINT=/var/run/crio/crio.sock
     export ALLOW_PRIVILEGED=1
 

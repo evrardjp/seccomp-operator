@@ -94,7 +94,8 @@ func TestHandle(t *testing.T) {
 					Items: []v1alpha1.ProfileRecording{
 						{
 							Spec: v1alpha1.ProfileRecordingSpec{
-								Kind: "SeccompProfile",
+								Kind:     v1alpha1.ProfileRecordingKindSeccompProfile,
+								Recorder: v1alpha1.ProfileRecorderHook,
 							},
 						},
 					},
@@ -142,7 +143,7 @@ func TestHandle(t *testing.T) {
 					Items: []v1alpha1.ProfileRecording{
 						{
 							Spec: v1alpha1.ProfileRecordingSpec{
-								Kind: "SeccompProfile",
+								Kind: v1alpha1.ProfileRecordingKindSeccompProfile,
 							},
 						},
 					},
@@ -160,7 +161,7 @@ func TestHandle(t *testing.T) {
 					Items: []v1alpha1.ProfileRecording{
 						{
 							Spec: v1alpha1.ProfileRecordingSpec{
-								Kind: "SeccompProfile",
+								Kind: v1alpha1.ProfileRecordingKindSeccompProfile,
 							},
 						},
 					},
@@ -190,7 +191,8 @@ func TestHandle(t *testing.T) {
 					Items: []v1alpha1.ProfileRecording{
 						{
 							Spec: v1alpha1.ProfileRecordingSpec{
-								Kind: "SeccompProfile",
+								Kind:     v1alpha1.ProfileRecordingKindSeccompProfile,
+								Recorder: v1alpha1.ProfileRecorderHook,
 							},
 						},
 					},
@@ -224,7 +226,7 @@ func TestHandle(t *testing.T) {
 					Items: []v1alpha1.ProfileRecording{
 						{
 							Spec: v1alpha1.ProfileRecordingSpec{
-								Kind: "SeccompProfile",
+								Kind: v1alpha1.ProfileRecordingKindSeccompProfile,
 							},
 							Status: v1alpha1.ProfileRecordingStatus{
 								ActiveWorkloads: []string{"1", "2", "3"},
@@ -250,7 +252,7 @@ func TestHandle(t *testing.T) {
 					Items: []v1alpha1.ProfileRecording{
 						{
 							Spec: v1alpha1.ProfileRecordingSpec{
-								Kind: "SeccompProfile",
+								Kind: v1alpha1.ProfileRecordingKindSeccompProfile,
 							},
 							Status: v1alpha1.ProfileRecordingStatus{
 								ActiveWorkloads: []string{"1", "2", "3"},

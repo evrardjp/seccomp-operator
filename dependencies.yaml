@@ -1,0 +1,84 @@
+dependencies:
+  - name: go
+    version: 1.16
+    refPaths:
+    - path: .github/workflows/build.yml
+      match: GO_VERSION
+    - path: .github/workflows/test.yml
+      match: GO_VERSION
+    - path: hack/ci/Vagrantfile
+      match: GO_VERSION
+
+  - name: golangci-lint
+    version: 1.41.1
+    refPaths:
+    - path: Makefile
+      match: GOLANGCI_LINT_VERSION
+
+  - name: repo-infra
+    version: 0.1.8
+    refPaths:
+    - path: Makefile
+      match: REPO_INFRA_VERSION
+
+  - name: kustomize
+    version: 4.2.0
+    refPaths:
+    - path: Makefile
+      match: KUSTOMIZE_VERSION
+
+  - name: cert-manager
+    version: 1.4.0
+    refPaths:
+    - path: test/e2e_test.go
+      match: jetstack/cert-manager
+    - path: installation-usage.md
+      match: jetstack/cert-manager
+
+  - name: kind
+    version: 0.11.1
+    refPaths:
+    - path: test/suite_test.go
+      match: kindVersion
+
+  - name: kind-image
+    version: 1.21.1
+    refPaths:
+    - path: test/suite_test.go
+      match: kindest/node
+
+  - name: qemu
+    version: 5.2.0-2
+    refPaths:
+    - path: hack/image-cross.sh
+      match: QEMUVERSION
+
+  - name: e2e-kubernetes
+    version: 1.21.0
+    refPaths:
+    - path: hack/ci/install-kubernetes.sh
+      match: VERSION
+
+  - name: e2e-fedora
+    version: 33
+    refPaths:
+    - path: hack/ci/Vagrantfile
+      match: fedora
+
+  - name: debian-base
+    version: 1.6.0
+    refPaths:
+    - path: hack/build-image/Dockerfile
+      match: k8s.gcr.io/build-image/debian-base
+
+  - name: nix
+    version: 2.3.10
+    refPaths:
+    - path: hack/build-image/Dockerfile
+      match: NIX_VERSION
+
+  - name: kube-rbac-proxy
+    version: 0.9.0
+    refPaths:
+    - path: internal/pkg/manager/spod/bindata/spod.go
+      match: quay.io/brancz/kube-rbac-proxy

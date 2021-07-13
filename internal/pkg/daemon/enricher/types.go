@@ -16,26 +16,25 @@ limitations under the License.
 
 package enricher
 
-import "errors"
-
-var (
-	errUnsupportedContainerRuntime = errors.New("unsupported container runtime")
-	errUnsupportedLogLine          = errors.New("unsupported log line")
+const (
+	auditTypeSeccomp = "seccomp"
+	auditTypeSelinux = "selinux"
 )
 
 type auditLine struct {
-	ProcessID    int
-	SystemCallID int
-	Type         string
-	TimestampID  string
-	Executable   string
+	processID    int
+	systemCallID int
+	type_        string
+	timestampID  string
+	executable   string
 }
 
 type containerInfo struct {
-	PodName       string
-	ContainerName string
-	Namespace     string
-	ContainerID   string
+	podName       string
+	containerName string
+	namespace     string
+	containerID   string
+	recordProfile string
 }
 
 // List of x86-x64 syscalls

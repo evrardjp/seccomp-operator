@@ -1,0 +1,33 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spo-metrics-client
+rules:
+- nonResourceURLs:
+  - /metrics
+  - /metrics-spod
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spo-metrics-client
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spo-metrics-client
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: security-profiles-operator
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: metrics-token
+  namespace: security-profiles-operator
+  annotations:
+    kubernetes.io/service-account.name: default
+type: kubernetes.io/service-account-token

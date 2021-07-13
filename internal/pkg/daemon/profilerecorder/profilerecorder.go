@@ -21,16 +21,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/containers/common/pkg/seccomp"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,9 +44,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
+	profilerecording1alpha1 "sigs.k8s.io/security-profiles-operator/api/profilerecording/v1alpha1"
 	"sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1alpha1"
+	api "sigs.k8s.io/security-profiles-operator/api/server"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/controller"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/metrics"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/server"
 )
 
 const (
@@ -61,17 +70,43 @@ const (
 	reasonAnnotationParsing     event.Reason = "SeccompAnnotationParsing"
 )
 
+// NewController returns a new empty controller instance.
+func NewController() controller.Controller {
+	return &RecorderReconciler{}
+}
+
 type RecorderReconciler struct {
 	client        client.Client
+	grpcClient    api.SecurityProfilesOperatorClient
 	log           logr.Logger
 	record        event.Recorder
 	nodeAddresses []string
 	podsToWatch   sync.Map
 }
 
+type podToWatch struct {
+	recorder profilerecording1alpha1.ProfileRecorder
+	profiles []string
+}
+
+// Name returns the name of the controller.
+func (r *RecorderReconciler) Name() string {
+	return "recorder-spod"
+}
+
+// SchemeBuilder returns the API scheme of the controller.
+func (r *RecorderReconciler) SchemeBuilder() *scheme.Builder {
+	return profilerecording1alpha1.SchemeBuilder
+}
+
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 
-func Setup(ctx context.Context, mgr ctrl.Manager, l logr.Logger) error {
+// Setup is the initialization of the controller.
+func (r *RecorderReconciler) Setup(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	met *metrics.Metrics,
+) error {
 	const name = "profilerecorder"
 	c, err := client.New(mgr.GetConfig(), client.Options{})
 	if err != nil {
@@ -87,10 +122,11 @@ func Setup(ctx context.Context, mgr ctrl.Manager, l logr.Logger) error {
 		return errors.Wrap(err, errGetNode)
 	}
 
+	r.log = ctrl.Log.WithName(r.Name())
 	nodeAddresses := []string{}
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP {
-			l.Info("Setting up profile recorder", "Node", addr.Address)
+			r.log.Info("Setting up profile recorder", "Node", addr.Address)
 			nodeAddresses = append(nodeAddresses, addr.Address)
 			break
 		}
@@ -100,21 +136,30 @@ func Setup(ctx context.Context, mgr ctrl.Manager, l logr.Logger) error {
 		return errors.New("Unable to get node's internal Address")
 	}
 
-	reconciler := RecorderReconciler{
-		client:        mgr.GetClient(),
-		log:           l,
-		nodeAddresses: nodeAddresses,
-		record:        event.NewAPIRecorder(mgr.GetEventRecorderFor(name)),
+	r.log.Info("Connecting to local GRPC server")
+	conn, err := grpc.Dial(server.Addr(), grpc.WithInsecure())
+	if err != nil {
+		return errors.Wrap(err, "connecting to local GRPC server")
 	}
+
+	r.grpcClient = api.NewSecurityProfilesOperatorClient(conn)
+	r.client = mgr.GetClient()
+	r.nodeAddresses = nodeAddresses
+	r.record = event.NewAPIRecorder(mgr.GetEventRecorderFor(name))
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		WithEventFilter(predicate.And(
-			resource.NewPredicates(reconciler.isPodWithTraceAnnotation),
-			resource.NewPredicates(reconciler.isPodOnLocalNode),
+			resource.NewPredicates(r.isPodWithTraceAnnotation),
+			resource.NewPredicates(r.isPodOnLocalNode),
 		)).
 		For(&corev1.Pod{}).
-		Complete(&reconciler)
+		Complete(r)
+}
+
+// Healthz is the liveness probe endpoint of the controller.
+func (r *RecorderReconciler) Healthz(*http.Request) error {
+	return nil
 }
 
 func (r *RecorderReconciler) isPodOnLocalNode(obj runtime.Object) bool {
@@ -141,7 +186,8 @@ func (r *RecorderReconciler) isPodWithTraceAnnotation(obj runtime.Object) bool {
 	}
 
 	for key := range p.Annotations {
-		if strings.HasPrefix(key, config.SeccompProfileRecordAnnotationKey+"/") {
+		if strings.HasPrefix(key, config.SeccompProfileRecordHookAnnotationKey) ||
+			strings.HasPrefix(key, config.SeccompProfileRecordLogsAnnotationKey) {
 			return true
 		}
 	}
@@ -160,7 +206,7 @@ func (r *RecorderReconciler) Reconcile(_ context.Context, req reconcile.Request)
 	if err := r.client.Get(ctx, req.NamespacedName, pod); err != nil {
 		if kerrors.IsNotFound(err) {
 			if err := r.collectProfile(ctx, req.NamespacedName); err != nil {
-				return reconcile.Result{}, nil
+				return reconcile.Result{}, errors.Wrap(err, "collect profile for removed pod")
 			}
 		} else {
 			// Returning an error means we will be requeued implicitly.
@@ -175,75 +221,202 @@ func (r *RecorderReconciler) Reconcile(_ context.Context, req reconcile.Request)
 			return reconcile.Result{}, nil
 		}
 
-		outputFiles, err := parseAnnotations(pod.Annotations)
+		hookProfiles, err := parseHookAnnotations(pod.Annotations)
 		if err != nil {
 			// Malformed annotations could be set by users directly, which is
 			// why we are ignoring them.
-			logger.Info("Ignoring because unable to parse annotation", "error", err)
+			logger.Info("Ignoring because unable to parse hook annotation", "error", err)
 			r.record.Event(pod, event.Warning(reasonAnnotationParsing, err))
 			return reconcile.Result{}, nil
 		}
 
+		logProfiles, err := parseLogAnnotations(pod.Annotations)
+		if err != nil {
+			// Malformed annotations could be set by users directly, which is
+			// why we are ignoring them.
+			logger.Info("Ignoring because unable to parse log annotation", "error", err)
+			r.record.Event(pod, event.Warning(reasonAnnotationParsing, err))
+			return reconcile.Result{}, nil
+		}
+
+		var profiles []string
+		var recorder profilerecording1alpha1.ProfileRecorder
+		if len(hookProfiles) > 0 { // nolint: gocritic
+			profiles = hookProfiles
+			recorder = profilerecording1alpha1.ProfileRecorderHook
+		} else if len(logProfiles) > 0 {
+			profiles = logProfiles
+			recorder = profilerecording1alpha1.ProfileRecorderLogs
+		} else {
+			logger.Info("Neither hook nor log annotations found on pod")
+			return reconcile.Result{}, nil
+		}
+
 		logger.Info(fmt.Sprintf(
-			"Recording seccomp profiles: %s", strings.Join(outputFiles, ", "),
+			"Recording seccomp profiles for pod %s: %s",
+			req.NamespacedName.String(),
+			strings.Join(profiles, ", "),
 		))
-		r.podsToWatch.Store(req.NamespacedName.String(), outputFiles)
+		r.podsToWatch.Store(
+			req.NamespacedName.String(),
+			podToWatch{recorder, profiles},
+		)
 		r.record.Event(pod, event.Normal(reasonProfileRecording, "Recording seccomp profiles"))
 	}
 
 	if pod.Status.Phase == corev1.PodSucceeded {
 		if err := r.collectProfile(ctx, req.NamespacedName); err != nil {
-			return reconcile.Result{}, nil
+			return reconcile.Result{}, errors.Wrap(err, "collect profile for succeeded pod")
 		}
 	}
 
 	return reconcile.Result{}, nil
 }
 
-func (r *RecorderReconciler) collectProfile(ctx context.Context, name types.NamespacedName) (res error) {
-	defer r.podsToWatch.Delete(name.String())
+func (r *RecorderReconciler) collectProfile(
+	ctx context.Context, name types.NamespacedName,
+) error {
+	n := name.String()
 
-	if value, ok := r.podsToWatch.Load(name.String()); ok {
-		for _, profilePath := range value.([]string) {
-			r.log.Info("Collecting profile", "path", profilePath)
+	value, ok := r.podsToWatch.Load(n)
+	if !ok {
+		return nil
+	}
 
-			data, err := ioutil.ReadFile(profilePath)
-			if err != nil {
-				r.log.Error(err, "Failed to read profile")
-				return errors.Wrap(err, "read profile")
-			}
+	podToWatch, ok := value.(podToWatch)
+	if !ok {
+		return errors.New("type assert pod to watch")
+	}
 
-			// Remove the file extension and timestamp
-			base := filepath.Base(profilePath)
-			lastIndex := strings.LastIndex(base, "-")
-			if lastIndex == -1 {
-				return errors.Errorf("malformed profile path: %s", profilePath)
-			}
-			profileName := base[:lastIndex]
+	if podToWatch.recorder == profilerecording1alpha1.ProfileRecorderHook {
+		if err := r.collectLocalProfiles(
+			ctx, name, podToWatch.profiles,
+		); err != nil {
+			return errors.Wrap(err, "collect local profile")
+		}
+	}
 
-			profile := &v1alpha1.SeccompProfile{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      profileName,
-					Namespace: name.Namespace,
-				},
-			}
-			res, err := controllerutil.CreateOrUpdate(ctx, r.client, profile,
-				func() error {
-					return errors.Wrap(
-						json.Unmarshal(data, &profile.Spec),
-						"unmarshal profile spec JSON",
-					)
-				},
+	if podToWatch.recorder == profilerecording1alpha1.ProfileRecorderLogs {
+		if err := r.collectLogProfiles(
+			ctx, name, podToWatch.profiles,
+		); err != nil {
+			return errors.Wrap(err, "collect log profile")
+		}
+	}
+
+	r.podsToWatch.Delete(n)
+	return nil
+}
+
+func (r *RecorderReconciler) collectLocalProfiles(
+	ctx context.Context,
+	name types.NamespacedName,
+	profiles []string,
+) error {
+	for _, profilePath := range profiles {
+		r.log.Info("Collecting profile", "path", profilePath)
+
+		data, err := ioutil.ReadFile(profilePath)
+		if err != nil {
+			r.log.Error(err, "Failed to read profile")
+			return errors.Wrap(err, "read profile")
+		}
+
+		// Remove the file extension and timestamp
+		profileName, err := extractProfileName(filepath.Base(profilePath))
+		if err != nil {
+			return errors.Wrap(err, "extract profile name")
+		}
+
+		profile := &v1alpha1.SeccompProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      profileName,
+				Namespace: name.Namespace,
+			},
+		}
+		res, err := controllerutil.CreateOrUpdate(ctx, r.client, profile,
+			func() error {
+				return errors.Wrap(
+					json.Unmarshal(data, &profile.Spec),
+					"unmarshal profile spec JSON",
+				)
+			},
+		)
+		if err != nil {
+			r.log.Error(err, "Cannot create seccompprofile resource")
+			r.record.Event(profile, event.Warning(reasonProfileCreationFailed, err))
+			return errors.Wrap(err, "create seccompProfile resource")
+		}
+		r.log.Info("Created/updated profile", "action", res, "name", profileName)
+		r.record.Event(
+			profile,
+			event.Normal(reasonProfileCreated, "seccomp profile created"),
+		)
+	}
+
+	return nil
+}
+
+func (r *RecorderReconciler) collectLogProfiles(
+	ctx context.Context,
+	name types.NamespacedName,
+	profiles []string,
+) error {
+	for _, profileID := range profiles {
+		// Remove the timestamp
+		profileName, err := extractProfileName(profileID)
+		if err != nil {
+			return errors.Wrap(err, "extract profile name")
+		}
+
+		r.log.Info("Collecting profile", "name", profileName)
+
+		// Retrieve the syscalls for the recording
+		request := &api.SyscallsRequest{Profile: profileID}
+		response, err := r.grpcClient.Syscalls(ctx, request)
+		if err != nil {
+			return errors.Wrapf(
+				err, "retrieve syscalls for profile %s", profileID,
 			)
-			if err != nil {
-				r.log.Error(err, "Cannot create seccompprofile resource")
-				r.record.Event(profile, event.Warning(reasonProfileCreationFailed, err))
-				return errors.Wrap(err, "create seccompProfile resource")
-			}
-			r.log.Info("Created/updated profile", "action", res, "name", profileName)
-			r.record.Event(
-				profile,
-				event.Normal(reasonProfileCreated, "seccomp profile created"),
+		}
+
+		profileSpec := v1alpha1.SeccompProfileSpec{
+			DefaultAction: seccomp.ActErrno,
+			Syscalls: []*v1alpha1.Syscall{{
+				Action: seccomp.ActAllow,
+				Names:  response.GetSyscalls(),
+			}},
+		}
+
+		profile := &v1alpha1.SeccompProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      profileName,
+				Namespace: name.Namespace,
+			},
+			Spec: profileSpec,
+		}
+
+		res, err := controllerutil.CreateOrUpdate(ctx, r.client, profile,
+			func() error {
+				profile.Spec = profileSpec
+				return nil
+			},
+		)
+		if err != nil {
+			r.log.Error(err, "Cannot create seccompprofile resource")
+			r.record.Event(profile, event.Warning(reasonProfileCreationFailed, err))
+			return errors.Wrap(err, "create seccompProfile resource")
+		}
+		r.log.Info("Created/updated profile", "action", res, "name", profileName)
+		r.record.Event(
+			profile,
+			event.Normal(reasonProfileCreated, "seccomp profile created"),
+		)
+
+		// Reset the syscalls for further recordings
+		if _, err := r.grpcClient.ResetSyscalls(ctx, request); err != nil {
+			return errors.Wrapf(
+				err, "reset syscalls for profile %s", profileID,
 			)
 		}
 	}
@@ -251,13 +424,21 @@ func (r *RecorderReconciler) collectProfile(ctx context.Context, name types.Name
 	return nil
 }
 
-// parseAnnotations parses the provided annotations and extracts the mandatory
-// output files.
-func parseAnnotations(annotations map[string]string) (res []string, err error) {
+func extractProfileName(s string) (string, error) {
+	lastIndex := strings.LastIndex(s, "-")
+	if lastIndex == -1 {
+		return "", errors.Errorf("malformed profile path: %s", s)
+	}
+	return s[:lastIndex], nil
+}
+
+// parseHookAnnotations parses the provided annotations and extracts the
+// mandatory output files for the hook recorder.
+func parseHookAnnotations(annotations map[string]string) (res []string, err error) {
 	const prefix = "of:"
 
 	for key, value := range annotations {
-		if !strings.HasPrefix(key, config.SeccompProfileRecordAnnotationKey+"/") {
+		if !strings.HasPrefix(key, config.SeccompProfileRecordHookAnnotationKey) {
 			continue
 		}
 
@@ -283,6 +464,25 @@ func parseAnnotations(annotations map[string]string) (res []string, err error) {
 		}
 
 		res = append(res, outputFile)
+	}
+
+	return res, nil
+}
+
+// parseLogAnnotations parses the provided annotations and extracts the
+// mandatory output profiles for the log recorder.
+func parseLogAnnotations(annotations map[string]string) (res []string, err error) {
+	for key, profile := range annotations {
+		if !strings.HasPrefix(key, config.SeccompProfileRecordLogsAnnotationKey) {
+			continue
+		}
+
+		if profile == "" {
+			return nil, errors.Wrap(errors.New(errInvalidAnnotation),
+				"providing output profile is mandatory")
+		}
+
+		res = append(res, profile)
 	}
 
 	return res, nil

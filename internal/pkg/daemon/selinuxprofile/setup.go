@@ -21,31 +21,37 @@ import (
 	"text/template"
 
 	"github.com/crossplane/crossplane-runtime/pkg/event"
-	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	spov1alpha1 "sigs.k8s.io/security-profiles-operator/api/selinuxprofile/v1alpha1"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/metrics"
 )
 
 var log = logf.Log.WithName("selinuxprofile")
 
 // Setup adds a controller that reconciles seccomp profiles.
-func Setup(ctx context.Context, mgr ctrl.Manager, l logr.Logger) error {
+func (r *ReconcileSP) Setup(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	met *metrics.Metrics,
+) error {
 	// Create template to wrap policies
 	tmpl, err := template.New("profileWrapper").Parse(profileWrapper)
 	if err != nil {
 		return errors.Wrap(err, "creating profile wrapper template")
 	}
+
+	r.client = mgr.GetClient()
+	r.scheme = mgr.GetScheme()
+	r.policyTemplate = tmpl
+	r.record = event.NewAPIRecorder(mgr.GetEventRecorderFor("selinuxprofile"))
+	r.metrics = met
+
 	// Register the regular reconciler to manage SelinuxProfiles
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("profile").
 		For(&spov1alpha1.SelinuxProfile{}).
-		Complete(&ReconcileSP{
-			client:         mgr.GetClient(),
-			scheme:         mgr.GetScheme(),
-			policyTemplate: tmpl,
-			record:         event.NewAPIRecorder(mgr.GetEventRecorderFor("selinuxprofile")),
-		})
+		Complete(r)
 }

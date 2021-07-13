@@ -24,29 +24,36 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/release-utils/command"
+
 	"sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1alpha1"
 	secprofnodestatusv1alpha1 "sigs.k8s.io/security-profiles-operator/api/secprofnodestatus/v1alpha1"
 )
 
 const (
-	certmanager       = "https://github.com/jetstack/cert-manager/releases/download/v1.1.0/cert-manager.yaml"
+	certmanager       = "https://github.com/jetstack/cert-manager/releases/download/v1.4.0/cert-manager.yaml"
 	manifest          = "deploy/operator.yaml"
 	namespaceManifest = "deploy/namespace-operator.yaml"
-	webhookManifest   = "deploy/webhook.yaml"
 	testNamespace     = "test-ns"
 	defaultNamespace  = "default"
 	// NOTE(jaosorior): We should be able to decrease this once we
 	// migrate to a single daemonset-based implementation for the
 	// SELinux pieces.
-	defaultSelinuxOpTimeout = "360s"
-	defaultWaitTimeout      = "120s"
-	defaultWaitTime         = 10 * time.Second
+	defaultSelinuxOpTimeout     = "360s"
+	defaultLogEnricherOpTimeout = defaultSelinuxOpTimeout
+	defaultWaitTimeout          = "120s"
+	defaultWaitTime             = 10 * time.Second
 )
 
 func (e *e2e) TestSecurityProfilesOperator() {
+	e.logf("Waiting for all pods to become ready")
+	e.waitFor("condition=ready", "pods", "--all", "--all-namespaces")
+
+	// Deploy prerequisites
+	e.deployCertManager()
+
 	// Deploy the operator
 	e.deployOperator(manifest)
-	defer e.run("git", "checkout", manifest)
 
 	// Retrieve the inputs for the test cases
 	nodes := e.getWorkerNodes()
@@ -75,8 +82,16 @@ func (e *e2e) TestSecurityProfilesOperator() {
 			e.testCaseDeleteProfiles,
 		},
 		{
+			"Seccomp: Metrics",
+			e.testCaseSeccompMetrics,
+		},
+		{
 			"Seccomp: Re-deploy the operator",
 			e.testCaseReDeployOperator,
+		},
+		{
+			"Log Enricher",
+			e.testCaseLogEnricher,
 		},
 		{
 			"SELinux: sanity check",
@@ -85,6 +100,10 @@ func (e *e2e) TestSecurityProfilesOperator() {
 		{
 			"SELinux: base case (install policy, run pod and delete)",
 			e.testCaseSelinuxBaseUsage,
+		},
+		{
+			"SELinux: Metrics (update, delete)",
+			e.testCaseSelinuxMetrics,
 		},
 		{
 			"SPOD: Update SELinux flag",
@@ -98,11 +117,6 @@ func (e *e2e) TestSecurityProfilesOperator() {
 		})
 	}
 
-	if e.testProfileBinding || e.testProfileRecording {
-		e.deployWebhook(webhookManifest)
-		defer e.run("git", "checkout", webhookManifest)
-	}
-
 	// TODO(jaosorior): Re-introduce this to the namespaced tests once we
 	// fix the issue with the certs.
 	e.Run("cluster-wide: Seccomp: Verify profile binding", func() {
@@ -110,21 +124,23 @@ func (e *e2e) TestSecurityProfilesOperator() {
 	})
 
 	e.Run("cluster-wide: Seccomp: Verify profile recording", func() {
-		e.testCaseProfileRecordingStaticPod()
-		e.testCaseProfileRecordingKubectlRun()
-		e.testCaseProfileRecordingMultiContainer()
-		e.testCaseProfileRecordingDeployment()
+		e.testCaseProfileRecordingStaticPodHook()
+		e.testCaseProfileRecordingStaticPodLogs()
+		e.testCaseProfileRecordingKubectlRunHook()
+		e.testCaseProfileRecordingMultiContainerHook()
+		e.testCaseProfileRecordingMultiContainerLogs()
+		e.testCaseProfileRecordingDeploymentHook()
+		e.testCaseProfileRecordingDeploymentLogs()
 	})
-
-	e.cleanupWebhook(webhookManifest)
 
 	// Clean up cluster-wide deployment to prepare for namespace deployment
 	e.cleanupOperator(manifest)
+	e.run("git", "checkout", manifest)
 
 	e.logf("testing namespace operator")
 
 	// Use namespace manifests for redeploy test
-	testCases[4].fn = e.testCaseReDeployNamespaceOperator
+	testCases[5].fn = e.testCaseReDeployNamespaceOperator
 
 	// Deploy the namespace operator
 	e.kubectl("create", "namespace", testNamespace)
@@ -132,7 +148,6 @@ func (e *e2e) TestSecurityProfilesOperator() {
 		"sed", "-i", fmt.Sprintf("s/NS_REPLACE/%s/", testNamespace),
 		namespaceManifest,
 	)
-	defer e.run("git", "checkout", namespaceManifest)
 	// All following operations such as create pod will be in the test namespace
 	e.kubectl("config", "set-context", "--current", "--namespace", testNamespace)
 	e.deployOperator(namespaceManifest)
@@ -143,6 +158,66 @@ func (e *e2e) TestSecurityProfilesOperator() {
 			tc.fn(nodes)
 		})
 	}
+	e.run("git", "checkout", namespaceManifest)
+}
+
+func (e *e2e) deployCertManager() {
+	e.logf("Deploying cert-manager")
+	e.kubectl("apply", "-f", certmanager)
+
+	// https://cert-manager.io/docs/installation/kubernetes/#verifying-the-installation
+	e.waitFor(
+		"condition=ready",
+		"--namespace", "cert-manager",
+		"pod", "-l", "app.kubernetes.io/instance=cert-manager",
+	)
+
+	tries := 20
+	certManifest := `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager-test
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: test-selfsigned
+  namespace: cert-manager-test
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: selfsigned-cert
+  namespace: cert-manager-test
+spec:
+  dnsNames:
+    - example.com
+  secretName: selfsigned-cert-tls
+  issuerRef:
+    name: test-selfsigned
+`
+
+	file, err := ioutil.TempFile(os.TempDir(), "test-resource*.yaml")
+	e.Nil(err)
+	_, err = file.Write([]byte(certManifest))
+	e.Nil(err)
+	defer os.Remove(file.Name())
+	for i := 0; i < tries; i++ {
+		output, err := command.New(e.kubectlPath, "apply", "-f", file.Name()).Run()
+		e.Nil(err)
+		if output.Success() {
+			break
+		}
+		time.Sleep(defaultWaitTime)
+	}
+	e.waitFor(
+		"condition=Ready",
+		"certificate", "selfsigned-cert",
+		"--namespace", "cert-manager-test",
+	)
 }
 
 func (e *e2e) deployOperator(manifest string) {
@@ -188,8 +263,8 @@ func (e *e2e) deployOperator(manifest string) {
 	e.waitInOperatorNSFor("condition=ready", "pod", "-l", "app=security-profiles-operator")
 	// Wait for all pods in DaemonSet
 	time.Sleep(defaultWaitTime)
-	e.waitInOperatorNSFor("condition=initialized", "pod", "-l", "app=spod")
-	e.waitInOperatorNSFor("condition=ready", "pod", "-l", "app=spod")
+	e.waitInOperatorNSFor("condition=initialized", "pod", "-l", "name=spod")
+	e.waitInOperatorNSFor("condition=ready", "pod", "-l", "name=spod")
 }
 
 func (e *e2e) cleanupOperator(manifest string) {
@@ -197,42 +272,6 @@ func (e *e2e) cleanupOperator(manifest string) {
 	e.logf("Cleaning up operator")
 	e.kubectl("delete", "seccompprofiles", "--all", "--all-namespaces")
 	e.kubectl("delete", "--ignore-not-found", "-f", manifest)
-}
-
-func (e *e2e) deployWebhook(manifest string) {
-	// Deploy prerequisites
-	e.logf("Deploying cert-manager")
-	e.kubectl("apply", "-f", certmanager)
-	e.waitFor(
-		"condition=ready",
-		"--namespace", "cert-manager",
-		"pod", "-l", "app.kubernetes.io/instance=cert-manager",
-	)
-	e.run(
-		"sed", "-i", fmt.Sprintf("s;image: .*gcr.io/.*;image: %s;g", e.testImage),
-		manifest,
-	)
-	e.run(
-		"sed", "-i",
-		fmt.Sprintf("s;imagePullPolicy: Always;imagePullPolicy: %s;g", e.pullPolicy),
-		manifest,
-	)
-	e.logf("Deploying webhook")
-	e.kubectl("create", "-f", manifest)
-	e.waitInOperatorNSFor("condition=ready", "pod", "-l", "name=security-profiles-operator-webhook")
-	e.waitInOperatorNSFor("condition=ready", "certificate", "webhook-cert")
-
-	e.retry(func(i int) bool {
-		e.logf("Waiting webhook to acquired lease (%d)", i)
-		output := e.kubectlOperatorNS("logs", "-l", "name=security-profiles-operator-webhook")
-		return strings.Contains(output, "successfully acquired lease")
-	})
-}
-
-func (e *e2e) cleanupWebhook(manifest string) {
-	e.logf("Cleaning up webhook")
-	e.kubectl("delete", "--ignore-not-found", "-f", manifest)
-	e.kubectl("delete", "--ignore-not-found", "-f", certmanager)
 }
 
 func (e *e2e) getWorkerNodes() []string {
@@ -326,11 +365,19 @@ func (e *e2e) sliceContainsString(slice []string, s string) bool {
 	return false
 }
 
-func (e *e2e) retry(f func(iteration int) (abort bool)) {
+func (e *e2e) retryGet(args ...string) string {
 	for i := 0; i < 20; i++ {
-		if f(i) {
-			break
+		output, err := command.New(
+			e.kubectlPath, append([]string{"get"}, args...)...,
+		).RunSilent()
+		e.Nil(err)
+		if !strings.Contains(output.Error(), "not found") {
+			return output.OutputTrimNL()
 		}
+		e.logf("Waiting for resource to be available (%d)", i)
 		time.Sleep(3 * time.Second)
 	}
+
+	e.Fail("Timed out to wait for resource")
+	return ""
 }

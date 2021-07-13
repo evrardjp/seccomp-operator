@@ -25,8 +25,9 @@ import (
 
 // type IDs are defined at https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/audit.h
 var (
-	//nolint:lll
-	seccompLineRegex = regexp.MustCompile(`(type=SECCOMP|audit:.+type=1326).+audit\((.+)\).+pid=(\b\d+\b).+exe="(.+)".+syscall=(\b\d+\b).*`)
+	seccompLineRegex = regexp.MustCompile(
+		`(type=SECCOMP|audit:.+type=1326).+audit\((.+)\).+pid=(\b\d+\b).+exe="(.+)".+syscall=(\b\d+\b).*`,
+	)
 	selinuxLineRegex = regexp.MustCompile(`type=AVC.+audit\((.+)\).+pid=(\b\d+\b).*`)
 )
 
@@ -56,7 +57,7 @@ func extractAuditLine(logLine string) (*auditLine, error) {
 		return selinux, nil
 	}
 
-	return nil, errors.Wrap(errUnsupportedLogLine, logLine)
+	return nil, errors.Errorf("unsupported log line: %s", logLine)
 }
 
 func extractSeccompLine(logLine string) *auditLine {
@@ -66,14 +67,14 @@ func extractSeccompLine(logLine string) *auditLine {
 	}
 
 	line := auditLine{}
-	line.Type = "seccomp"
-	line.TimestampID = captures[2]
-	line.Executable = captures[4]
+	line.type_ = auditTypeSeccomp
+	line.timestampID = captures[2]
+	line.executable = captures[4]
 	if v, err := strconv.Atoi(captures[3]); err == nil {
-		line.ProcessID = v
+		line.processID = v
 	}
 	if v, err := strconv.Atoi(captures[5]); err == nil {
-		line.SystemCallID = v
+		line.systemCallID = v
 	}
 
 	return &line
@@ -86,10 +87,10 @@ func extractSelinuxLine(logLine string) *auditLine {
 	}
 
 	line := auditLine{}
-	line.Type = "selinux"
-	line.TimestampID = captures[1]
+	line.type_ = auditTypeSelinux
+	line.timestampID = captures[1]
 	if v, err := strconv.Atoi(captures[2]); err == nil {
-		line.ProcessID = v
+		line.processID = v
 	}
 
 	return &line

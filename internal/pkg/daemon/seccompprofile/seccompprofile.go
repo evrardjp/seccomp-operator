@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path"
 	"time"
@@ -34,10 +35,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
 	"sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1alpha1"
 	statusv1alpha1 "sigs.k8s.io/security-profiles-operator/api/secprofnodestatus/v1alpha1"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/atomic"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/controller"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/metrics"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/nodestatus"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/util"
 )
@@ -69,28 +74,58 @@ const (
 	reasonSavedProfile event.Reason = "SavedSeccompProfile"
 )
 
-// Setup adds a controller that reconciles seccomp profiles.
-func Setup(ctx context.Context, mgr ctrl.Manager, l logr.Logger) error {
-	// Register the regular reconciler to manage SeccompProfiles
-	return ctrl.NewControllerManagedBy(mgr).
-		Named("profile").
-		For(&v1alpha1.SeccompProfile{}).
-		Complete(&Reconciler{
-			client: mgr.GetClient(),
-			log:    l,
-			record: event.NewAPIRecorder(mgr.GetEventRecorderFor("profile")),
-			save:   saveProfileOnDisk,
-		})
+// NewController returns a new empty controller instance.
+func NewController() controller.Controller {
+	return &Reconciler{}
 }
 
 type saver func(string, []byte) (bool, error)
 
 // A Reconciler reconciles seccomp profiles.
 type Reconciler struct {
-	client client.Client
-	log    logr.Logger
-	record event.Recorder
-	save   saver
+	client  client.Client
+	log     logr.Logger
+	record  event.Recorder
+	save    saver
+	metrics *metrics.Metrics
+	ready   atomic.Bool
+}
+
+// Name returns the name of the controller.
+func (r *Reconciler) Name() string {
+	return "seccomp-spod"
+}
+
+// SchemeBuilder returns the API scheme of the controller.
+func (r *Reconciler) SchemeBuilder() *scheme.Builder {
+	return v1alpha1.SchemeBuilder
+}
+
+// Setup adds a controller that reconciles seccomp profiles.
+func (r *Reconciler) Setup(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	met *metrics.Metrics,
+) error {
+	r.client = mgr.GetClient()
+	r.log = ctrl.Log.WithName(r.Name())
+	r.record = event.NewAPIRecorder(mgr.GetEventRecorderFor("profile"))
+	r.save = saveProfileOnDisk
+	r.metrics = met
+
+	// Register the regular reconciler to manage SeccompProfiles
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("profile").
+		For(&v1alpha1.SeccompProfile{}).
+		Complete(r)
+}
+
+// Healthz is the liveness probe endpoint of the controller.
+func (r *Reconciler) Healthz(*http.Request) error {
+	if !r.ready.Get() {
+		return errors.New("not ready")
+	}
+	return nil
 }
 
 // Security Profiles Operator RBAC permissions to manage SeccompProfile
@@ -110,6 +145,11 @@ type Reconciler struct {
 
 // Reconcile reconciles a SeccompProfile.
 func (r *Reconciler) Reconcile(_ context.Context, req reconcile.Request) (reconcile.Result, error) {
+	// Mark the controller as ready if the first reconcile has been finished
+	if !r.ready.Get() {
+		defer func() { r.ready.Set(true) }()
+	}
+
 	logger := r.log.WithValues("profile", req.Name, "namespace", req.Namespace)
 
 	ctx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
@@ -120,6 +160,7 @@ func (r *Reconciler) Reconcile(_ context.Context, req reconcile.Request) (reconc
 		err := errors.New("profile not added")
 		logger.Error(err, fmt.Sprintf("node %q does not support seccomp", os.Getenv(config.NodeNameEnvKey)))
 		if r.record != nil {
+			r.metrics.IncSeccompProfileError(reasonSeccompNotSupported)
 			r.record.Event(&v1alpha1.SeccompProfile{},
 				event.Warning(reasonSeccompNotSupported, err, os.Getenv(config.NodeNameEnvKey),
 					"node does not support seccomp"))
@@ -192,6 +233,7 @@ func (r *Reconciler) mergeBaseProfile(
 	if err := r.client.Get(
 		ctx, util.NamespacedName(baseProfileName, sp.GetNamespace()), baseProfile); err != nil {
 		l.Error(err, "cannot retrieve base profile "+baseProfileName)
+		r.metrics.IncSeccompProfileError(reasonInvalidSeccompProfile)
 		r.record.Event(sp, event.Warning(reasonInvalidSeccompProfile, err))
 		return op, errors.Wrap(err, "merging base profile")
 	}
@@ -222,6 +264,7 @@ func (r *Reconciler) reconcileSeccompProfile(
 	profileContent, err := json.Marshal(outputProfile)
 	if err != nil {
 		l.Error(err, "cannot validate profile "+profileName)
+		r.metrics.IncSeccompProfileError(reasonInvalidSeccompProfile)
 		r.record.Event(sp, event.Warning(reasonInvalidSeccompProfile, err))
 		return reconcile.Result{}, errors.Wrap(err, "cannot validate profile")
 	}
@@ -246,6 +289,7 @@ func (r *Reconciler) reconcileSeccompProfile(
 	updated, err := r.save(profilePath, profileContent)
 	if err != nil {
 		l.Error(err, "cannot save profile into disk")
+		r.metrics.IncSeccompProfileError(reasonCannotSaveProfile)
 		r.record.Event(sp, event.Warning(reasonCannotSaveProfile, err))
 		return reconcile.Result{}, errors.Wrap(err, "cannot save profile into disk")
 	}
@@ -263,6 +307,7 @@ func (r *Reconciler) reconcileSeccompProfile(
 
 	if err := nodeStatus.SetNodeStatus(ctx, statusv1alpha1.ProfileStateInstalled); err != nil {
 		l.Error(err, "cannot update node status")
+		r.metrics.IncSeccompProfileError(reasonCannotUpdateStatus)
 		r.record.Event(sp, event.Warning(reasonCannotUpdateStatus, err))
 		return reconcile.Result{}, errors.Wrap(err, "updating status in SeccompProfile reconciler")
 	}
@@ -274,6 +319,7 @@ func (r *Reconciler) reconcileSeccompProfile(
 	)
 	if updated {
 		evstr := fmt.Sprintf("Successfully saved profile to disk on %s", os.Getenv(config.NodeNameEnvKey))
+		r.metrics.IncSeccompProfileUpdate()
 		r.record.Event(sp, event.Normal(reasonSavedProfile, evstr))
 	}
 	return reconcile.Result{}, nil
@@ -301,6 +347,7 @@ func (r *Reconciler) reconcileDeletion(
 			r.log.Info("setting status to terminating")
 			if err := nsc.SetNodeStatus(ctx, statusv1alpha1.ProfileStateTerminating); err != nil {
 				r.log.Error(err, "cannot update SeccompProfile status")
+				r.metrics.IncSeccompProfileError(reasonCannotUpdateProfile)
 				r.record.Event(sp, event.Warning(reasonCannotUpdateProfile, err))
 				return reconcile.Result{}, errors.Wrap(err, "updating status for deleted SeccompProfile")
 			}
@@ -313,21 +360,23 @@ func (r *Reconciler) reconcileDeletion(
 		return reconcile.Result{RequeueAfter: wait}, nil
 	}
 
-	if err := handleDeletion(sp, r.log); err != nil {
+	if err := r.handleDeletion(sp); err != nil {
 		r.log.Error(err, "cannot delete profile")
+		r.metrics.IncSeccompProfileError(reasonCannotRemoveProfile)
 		r.record.Event(sp, event.Warning(reasonCannotRemoveProfile, err))
 		return ctrl.Result{}, errors.Wrap(err, "handling file deletion for deleted SeccompProfile")
 	}
 
 	if err := nsc.Remove(ctx, r.client); err != nil {
 		r.log.Error(err, "cannot remove node status/finalizer from seccomp profile")
+		r.metrics.IncSeccompProfileError(reasonCannotUpdateStatus)
 		r.record.Event(sp, event.Warning(reasonCannotUpdateStatus, err))
 		return ctrl.Result{}, errors.Wrap(err, "deleting node status/finalizer for deleted SeccompProfile")
 	}
 	return ctrl.Result{}, nil
 }
 
-func handleDeletion(sp *v1alpha1.SeccompProfile, l logr.Logger) error {
+func (r *Reconciler) handleDeletion(sp *v1alpha1.SeccompProfile) error {
 	profilePath := sp.GetProfilePath()
 	err := os.Remove(profilePath)
 	if os.IsNotExist(err) {
@@ -336,7 +385,8 @@ func handleDeletion(sp *v1alpha1.SeccompProfile, l logr.Logger) error {
 	if err != nil {
 		return errors.Wrap(err, "removing profile from host")
 	}
-	l.Info(fmt.Sprintf("removed profile %s", profilePath))
+	r.log.Info(fmt.Sprintf("removed profile %s", profilePath))
+	r.metrics.IncSeccompProfileDelete()
 	return nil
 }
 

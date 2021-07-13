@@ -17,10 +17,14 @@ limitations under the License.
 package bindata
 
 import (
+	"fmt"
+	"path/filepath"
+
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
 )
@@ -30,9 +34,11 @@ var (
 	truly                           = true
 	userRoot                  int64 = 0
 	userRootless                    = int64(config.UserRootless)
-	hostPathFile                    = v1.HostPathFile
 	hostPathDirectory               = v1.HostPathDirectory
 	hostPathDirectoryOrCreate       = v1.HostPathDirectoryOrCreate
+	metricsPort               int32 = 9443
+	healthzPath                     = "/healthz"
+	metricsCertPath                 = "/var/run/secrets/metrics"
 )
 
 const (
@@ -40,7 +46,7 @@ const (
 	SelinuxdPrivateDir   = "/var/run/selinuxd"
 	SelinuxdSocketPath   = SelinuxdPrivateDir + "/selinuxd.sock"
 	SelinuxdDBPath       = SelinuxdPrivateDir + "/selinuxd.db"
-	varLogSpoPath        = "/var/log/spo.log"
+	MetricsImage         = "quay.io/brancz/kube-rbac-proxy:v0.9.0"
 )
 
 var Manifest = &appsv1.DaemonSet{
@@ -50,7 +56,10 @@ var Manifest = &appsv1.DaemonSet{
 	},
 	Spec: appsv1.DaemonSetSpec{
 		Selector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{"app": "spod"},
+			MatchLabels: map[string]string{
+				"app":  config.OperatorName,
+				"name": "spod",
+			},
 		},
 		Template: v1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
@@ -60,7 +69,8 @@ var Manifest = &appsv1.DaemonSet{
 					v1.SeccompContainerAnnotationKeyPrefix + config.OperatorName: "localhost/security-profiles-operator.json",
 				},
 				Labels: map[string]string{
-					"app": "spod",
+					"app":  config.OperatorName,
+					"name": "spod",
 				},
 			},
 			Spec: v1.PodSpec{
@@ -79,6 +89,10 @@ var Manifest = &appsv1.DaemonSet{
 								Name:      "operator-profiles-volume",
 								MountPath: "/opt/spo-profiles",
 								ReadOnly:  true,
+							},
+							{
+								Name:      "metrics-cert-volume",
+								MountPath: metricsCertPath,
 							},
 						},
 						SecurityContext: &v1.SecurityContext{
@@ -250,6 +264,35 @@ semodule -i /opt/spo-profiles/selinuxd.cil
 								},
 							},
 						},
+						Ports: []v1.ContainerPort{
+							{
+								Name:          "liveness-port",
+								ContainerPort: config.HealthProbePort,
+								Protocol:      v1.ProtocolTCP,
+							},
+						},
+						StartupProbe: &v1.Probe{
+							Handler: v1.Handler{HTTPGet: &v1.HTTPGetAction{
+								Path:   healthzPath,
+								Port:   intstr.FromString("liveness-port"),
+								Scheme: v1.URISchemeHTTP,
+							}},
+							FailureThreshold: 10, // nolint: gomnd
+							PeriodSeconds:    3,  // nolint: gomnd
+							TimeoutSeconds:   1,
+							SuccessThreshold: 1,
+						},
+						LivenessProbe: &v1.Probe{
+							Handler: v1.Handler{HTTPGet: &v1.HTTPGetAction{
+								Path:   healthzPath,
+								Port:   intstr.FromString("liveness-port"),
+								Scheme: v1.URISchemeHTTP,
+							}},
+							FailureThreshold: 1,
+							PeriodSeconds:    10, // nolint: gomnd
+							TimeoutSeconds:   1,
+							SuccessThreshold: 1,
+						},
 					},
 					{
 						Name:  "selinuxd",
@@ -315,14 +358,21 @@ semodule -i /opt/spo-profiles/selinuxd.cil
 						ImagePullPolicy: v1.PullAlways,
 						VolumeMounts: []v1.VolumeMount{
 							{
-								Name:      "host-varlogspo-volume",
-								MountPath: varLogSpoPath,
+								Name:      "host-auditlog-volume",
+								MountPath: filepath.Dir(config.AuditLogPath),
+								ReadOnly:  true,
+							},
+							{
+								Name:      "host-syslog-volume",
+								MountPath: filepath.Dir(config.SyslogLogPath),
 								ReadOnly:  true,
 							},
 						},
 						SecurityContext: &v1.SecurityContext{
-							Privileged:             &falsely,
 							ReadOnlyRootFilesystem: &truly,
+							Privileged:             &truly,
+							RunAsUser:              &userRoot,
+							RunAsGroup:             &userRoot,
 							SELinuxOptions: &v1.SELinuxOptions{
 								// TODO(pjbgf): Use a more restricted selinux type
 								Type: "spc_t",
@@ -342,13 +392,49 @@ semodule -i /opt/spo-profiles/selinuxd.cil
 						},
 						Env: []v1.EnvVar{
 							{
-								Name: "NODE_NAME",
+								Name: config.NodeNameEnvKey,
 								ValueFrom: &v1.EnvVarSource{
 									FieldRef: &v1.ObjectFieldSelector{
-										APIVersion: "v1",
-										FieldPath:  "spec.nodeName",
+										FieldPath: "spec.nodeName",
 									},
 								},
+							},
+						},
+					},
+					{
+						Name:            "metrics",
+						Image:           MetricsImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Args: []string{
+							fmt.Sprintf("--secure-listen-address=0.0.0.0:%d", metricsPort),
+							"--upstream=http://127.0.0.1:8080",
+							"--v=10",
+							fmt.Sprintf("--tls-cert-file=%s", filepath.Join(metricsCertPath, "tls.crt")),
+							fmt.Sprintf("--tls-private-key-file=%s", filepath.Join(metricsCertPath, "tls.key")),
+						},
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceMemory:           resource.MustParse("32Mi"),
+								v1.ResourceCPU:              resource.MustParse("50m"),
+								v1.ResourceEphemeralStorage: resource.MustParse("10Mi"),
+							},
+							Limits: v1.ResourceList{
+								v1.ResourceMemory:           resource.MustParse("128Mi"),
+								v1.ResourceCPU:              resource.MustParse("150m"),
+								v1.ResourceEphemeralStorage: resource.MustParse("20Mi"),
+							},
+						},
+						SecurityContext: &v1.SecurityContext{
+							AllowPrivilegeEscalation: &falsely,
+						},
+						Ports: []v1.ContainerPort{
+							{Name: "https", ContainerPort: metricsPort},
+						},
+						VolumeMounts: []v1.VolumeMount{
+							{
+								Name:      "metrics-cert-volume",
+								MountPath: metricsCertPath,
+								ReadOnly:  true,
 							},
 						},
 					},
@@ -439,11 +525,28 @@ semodule -i /opt/spo-profiles/selinuxd.cil
 						},
 					},
 					{
-						Name: "host-varlogspo-volume",
+						Name: "host-auditlog-volume",
 						VolumeSource: v1.VolumeSource{
 							HostPath: &v1.HostPathVolumeSource{
-								Path: varLogSpoPath,
-								Type: &hostPathFile,
+								Path: filepath.Dir(config.AuditLogPath),
+								Type: &hostPathDirectoryOrCreate,
+							},
+						},
+					},
+					{
+						Name: "host-syslog-volume",
+						VolumeSource: v1.VolumeSource{
+							HostPath: &v1.HostPathVolumeSource{
+								Path: filepath.Dir(config.SyslogLogPath),
+								Type: &hostPathDirectoryOrCreate,
+							},
+						},
+					},
+					{
+						Name: "metrics-cert-volume",
+						VolumeSource: v1.VolumeSource{
+							Secret: &v1.SecretVolumeSource{
+								SecretName: "metrics-server-cert",
 							},
 						},
 					},
